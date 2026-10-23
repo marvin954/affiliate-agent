@@ -1,17 +1,90 @@
 import os
 import json
+import subprocess
+import shutil
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
-from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
+# --- Hermes configuration ---
+# Set HERMES_CMD in .env to the exact CLI invocation, e.g.:
+#   HERMES_CMD=/home/mammba/.hermes/hermes
+#   HERMES_CMD=hermes
+#   HERMES_CMD=/home/mammba/.hermes
+# If unset, we auto-detect: check for a binary in HERMES_PATH, then fall back to HTTP.
+HERMES_CMD = os.getenv("HERMES_CMD", "")
+HERMES_PATH = os.getenv("HERMES_PATH", "/home/mammba/.hermes")
+
+# HTTP fallback (Ollama / LM Studio) — used only if no CLI found
 HERMES_BASE_URL = os.getenv("HERMES_BASE_URL", "http://localhost:11434/v1")
 HERMES_MODEL = os.getenv("HERMES_MODEL", "hermes3")
+
+
+def _resolve_cli():
+    """Return the CLI binary path, or None if not found."""
+    if HERMES_CMD:
+        return HERMES_CMD
+    # Check if HERMES_PATH itself is executable
+    if os.path.isfile(HERMES_PATH) and os.access(HERMES_PATH, os.X_OK):
+        return HERMES_PATH
+    # Check for a binary named 'hermes' inside HERMES_PATH directory
+    candidate = os.path.join(HERMES_PATH, "hermes")
+    if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+        return candidate
+    # Check PATH
+    if shutil.which("hermes"):
+        return "hermes"
+    return None
+
+
+def call_hermes(prompt: str) -> str:
+    """Call Hermes CLI or HTTP and return the response text."""
+    cli = _resolve_cli()
+    if cli:
+        # Try common arg styles: positional, --prompt, -p, stdin
+        # First try passing prompt as a positional argument
+        try:
+            result = subprocess.run(
+                [cli, prompt],
+                capture_output=True, text=True, timeout=120
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+        except Exception:
+            pass
+        # Fallback: pass via stdin
+        try:
+            result = subprocess.run(
+                [cli],
+                input=prompt, capture_output=True, text=True, timeout=120
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip()
+            if result.stderr.strip():
+                raise RuntimeError(f"Hermes CLI error: {result.stderr.strip()[:300]}")
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("Hermes CLI timed out after 120s")
+    else:
+        # HTTP fallback
+        try:
+            from openai import OpenAI
+            client = OpenAI(base_url=HERMES_BASE_URL, api_key="local")
+            response = client.chat.completions.create(
+                model=HERMES_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=3000,
+                temperature=0.3,
+            )
+            return response.choices[0].message.content or ""
+        except ImportError:
+            raise RuntimeError("openai package not installed and no Hermes CLI found")
+    return ""
+
 
 app = FastAPI()
 
@@ -21,10 +94,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-
-def get_client():
-    return OpenAI(base_url=HERMES_BASE_URL, api_key="local")
 
 
 class ResearchRequest(BaseModel):
@@ -89,16 +158,11 @@ Rules:
 - Return ONLY the JSON array starting with [ and ending with ]"""
 
     def generate():
-        yield f"data: {json.dumps({'type': 'status', 'message': '🤖 Querying Hermes for affiliate programs...'})}\n\n"
+        cli = _resolve_cli()
+        source = f"Hermes CLI ({cli})" if cli else f"Hermes HTTP ({HERMES_BASE_URL})"
+        yield f"data: {json.dumps({'type': 'status', 'message': f'🤖 Querying {source}...'})}\n\n"
         try:
-            client = get_client()
-            response = client.chat.completions.create(
-                model=HERMES_MODEL,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=3000,
-                temperature=0.3,
-            )
-            text = response.choices[0].message.content or ""
+            text = call_hermes(prompt)
             start = text.find("[")
             end = text.rfind("]")
             if start == -1 or end <= start:
@@ -135,14 +199,7 @@ Requirements:
 Return ONLY the email text, nothing else."""
 
     try:
-        client = get_client()
-        response = client.chat.completions.create(
-            model=HERMES_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
-            temperature=0.7,
-        )
-        email = response.choices[0].message.content or ""
+        email = call_hermes(prompt)
         return {"email": email}
     except Exception as e:
         return {"error": str(e)}
